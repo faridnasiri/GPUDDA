@@ -1,0 +1,10 @@
+
+[nvme]
+   path = /mnt/nvme
+   browsable = yes
+   read only = no
+   guest ok = no
+   valid users = root
+   create mask = 0644
+   directory mask = 0755
+   force user = root
