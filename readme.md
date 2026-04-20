@@ -18,10 +18,11 @@
 8. [Phase 6 — NVIDIA RTX 5060 Ti GPU Passthrough](#8-phase-6--nvidia-rtx-5060-ti-gpu-passthrough)
 9. [Phase 7 — VM 104 NVIDIA Driver + AI Stack](#9-phase-7--vm-104-nvidia-driver--ai-stack)
 10. [Phase 8 — VM 106 (yt) VirtIO SCSI — The BSOD Journey](#10-phase-8--vm-106-yt-virtio-scsi--the-bsod-journey)
-11. [Final VM States](#11-final-vm-states)
-12. [Remaining Work](#12-remaining-work)
-13. [Key Lessons Learned](#13-key-lessons-learned)
-14. [Quick Reference — All Commands](#14-quick-reference--all-commands)
+11. [Phase 9 — VM 105 (guacamole) Linux Boot Fix](#11-phase-9--vm-105-guacamole-linux-boot-fix)
+12. [Final VM States](#12-final-vm-states)
+13. [Remaining Work](#13-remaining-work)
+14. [Key Lessons Learned](#14-key-lessons-learned)
+15. [Quick Reference — All Commands](#15-quick-reference--all-commands)
 
 ---
 
@@ -338,7 +339,7 @@ ln-sf /dev/null /etc/systemd/system/cloud-config.service
 rm /etc/netplan/50-cloud-init.yaml
 
 # Write static netplan (match by new MAC)
-write /etc/netplan/99-static.yaml "network:\n    version: 2\n    ethernets:\n        eth0:\n            match:\n                macaddress: bc:24:11:0a:15:e6\n            set-name: eth0\n            addresses:\n                - 192.168.0.200/24\n            routes:\n                - to: default\n                  via: 192.168.0.1\n            nameservers:\n                addresses: [8.8.8.8]\n            dhcp4: false\n"
+write /etc/netplan/99-static.yaml "network:\n    version: 2\n    ethernets:\n        eth0:\n            match:\n                macaddress: bc:24:11:0a:15:e6\n            set-name: eth0\n            addresses:\n                - 192.168.0.87/24\n            routes:\n                - to: default\n                  via: 192.168.0.1\n            nameservers:\n                addresses: [8.8.8.8]\n            dhcp4: false\n"
 
 # Enable serial console for 'qm terminal' access
 ln-sf /lib/systemd/system/serial-getty@.service \
@@ -408,8 +409,8 @@ guestfish -a /dev/pve/vm-104-disk-0 -i upload /tmp/grub.cfg /boot/grub/grub.cfg
 ```bash
 qm start 104
 # Wait 60s then:
-ping -c 3 192.168.0.200  # PING OK
-ssh arthur@192.168.0.200 "hostname && uptime"
+ping -c 3 192.168.0.87  # PING OK
+ssh arthur@192.168.0.87 "hostname && uptime"
 ```
 
 ---
@@ -481,7 +482,7 @@ qm set 104 --bios ovmf --machine q35
 ### Step 3: Start VM and verify GPU is visible
 
 ```bash
-ssh arthur@192.168.0.200 "lspci | grep -i nvidia"
+ssh arthur@192.168.0.87 "lspci | grep -i nvidia"
 # 05:00.0 VGA compatible controller: NVIDIA Corporation ...
 ```
 
@@ -492,7 +493,7 @@ ssh arthur@192.168.0.200 "lspci | grep -i nvidia"
 ### Install NVIDIA driver (580 open)
 
 ```bash
-ssh arthur@192.168.0.200 bash << 'EOF'
+ssh arthur@192.168.0.87 bash << 'EOF'
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-580-open
 sudo reboot
@@ -502,7 +503,7 @@ EOF
 Wait 60s, then verify:
 
 ```bash
-ssh arthur@192.168.0.200 "nvidia-smi"
+ssh arthur@192.168.0.87 "nvidia-smi"
 # Expected output:
 # +-----------------------------------------------------------------------------+
 # | NVIDIA-SMI 580.xx    Driver Version: 580.xx    CUDA Version: 13.0          |
@@ -515,15 +516,15 @@ ssh arthur@192.168.0.200 "nvidia-smi"
 Full script: [scripts/install-ai-stack.sh](scripts/install-ai-stack.sh)
 
 ```bash
-scp scripts/install-ai-stack.sh arthur@192.168.0.200:/tmp/
-ssh arthur@192.168.0.200 "bash /tmp/install-ai-stack.sh"
+scp scripts/install-ai-stack.sh arthur@192.168.0.87:/tmp/
+ssh arthur@192.168.0.87 "bash /tmp/install-ai-stack.sh"
 # Logged to /tmp/ai-setup.log
 ```
 
 ### Verify PyTorch CUDA
 
 ```bash
-ssh arthur@192.168.0.200 "source ~/ai-env/bin/activate && python -c \"
+ssh arthur@192.168.0.87 "source ~/ai-env/bin/activate && python -c \"
 import torch
 print('PyTorch:', torch.__version__)
 print('CUDA:', torch.cuda.is_available())
@@ -740,7 +741,158 @@ User: `farid` / `<password>`
 
 ---
 
-## 11. Final VM States
+## 11. Phase 9 — VM 105 (guacamole) Linux Boot Fix
+
+### Overview
+
+VM 105 runs Apache Guacamole (HTML5 remote-desktop gateway) as four Docker containers: `guacamole`, `guacd`, `nginx`, and `guac-db` (MySQL 8.0). Target IP: `192.168.0.86`.
+
+### Problem: Thin LV inactive — guestfish cannot open disk
+
+```bash
+guestfish -a /dev/pve/vm-105-disk-0 -i ls /etc/netplan/
+# libguestfs: error: could not create appliance
+```
+
+The LV was a thin provisioned volume in an inactive state (`Vwi---tz--`).
+
+**Fix:** Activate before using:
+
+```bash
+lvchange -ay pve/vm-105-disk-0
+lvs pve | grep vm-105   # Should now show: Vwi-a-tz--
+```
+
+### Guestfish offline patching
+
+Same pattern as VM 104 (see Phase 5). Key difference: MAC is `BC:24:11:EA:C0:FD`, IP is `192.168.0.86`.
+
+```bash
+guestfish -a /dev/pve/vm-105-disk-0 -i <<FISH
+# Disable cloud-init network management
+write /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg "network: {config: disabled}\n"
+
+# Mask boot-stalling units
+ln-sf /dev/null /etc/systemd/system/systemd-networkd-wait-online.service
+ln-sf /dev/null /etc/systemd/system/cloud-init-local.service
+ln-sf /dev/null /etc/systemd/system/cloud-init.service
+ln-sf /dev/null /etc/systemd/system/cloud-final.service
+ln-sf /dev/null /etc/systemd/system/cloud-config.service
+
+# Write static netplan
+write /etc/netplan/99-static.yaml "network:\n    version: 2\n    ethernets:\n        eth0:\n            match:\n                macaddress: bc:24:11:ea:c0:fd\n            set-name: eth0\n            addresses:\n                - 192.168.0.86/24\n            routes:\n                - to: default\n                  via: 192.168.0.1\n            nameservers:\n                addresses: [8.8.8.8]\n            dhcp4: false\n"
+
+# Enable serial console
+ln-sf /lib/systemd/system/serial-getty@.service \
+  /etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service
+FISH
+```
+
+### VM hardware config
+
+```bash
+qm set 105 --bios ovmf --machine q35 --cpu host
+qm set 105 --efidisk0 local-lvm:1,efitype=4m,pre-enrolled-keys=0
+qm set 105 --serial0 socket --vga std
+qm set 105 --balloon 512
+```
+
+> **`--cpu host` is required** — see lesson below about x86-64-v2.
+
+### Install SSH key
+
+```bash
+PUBKEY=$(cat ~/.ssh/authorized_keys | head -1)
+
+guestfish -a /dev/pve/vm-105-disk-0 -i <<FISH
+mkdir-p /root/.ssh
+write /root/.ssh/authorized_keys "${PUBKEY}\n"
+chmod 0700 /root/.ssh
+chmod 0600 /root/.ssh/authorized_keys
+FISH
+```
+
+> **Always write the actual key from `~/.ssh/authorized_keys`.** Using a redacted placeholder from documentation causes SSH auth to fail on first boot.
+
+### First boot
+
+```bash
+qm start 105
+sleep 80
+ping -c 2 192.168.0.86   # PING OK ✅
+```
+
+### Problem: Filesystem dirty flag after force-kill
+
+A force-kill (`kill -9` on the QEMU process) without graceful shutdown left the filesystem with a dirty flag. Next boot: PING FAILED.
+
+**Fix:** Stop VM, expose inner partitions with kpartx, fsck both partitions:
+
+```bash
+# Expose partition devices inside the LV
+kpartx -av /dev/pve/vm-105-disk-0
+# Creates: /dev/mapper/pve-vm--105--disk--0p1  (EFI)
+#          /dev/mapper/pve-vm--105--disk--0p2  (boot /ext4)
+
+# Activate ubuntu-vg from within the LV
+vgscan
+vgchange -ay ubuntu-vg
+
+# fsck both ext4 filesystems
+e2fsck -p /dev/mapper/pve-vm--105--disk--0p2    # /boot partition
+e2fsck -p /dev/ubuntu-vg/ubuntu-lv              # root partition
+
+# Cleanup
+kpartx -dv /dev/pve/vm-105-disk-0
+```
+
+### Problem: MySQL 8.0 crashing — CPU does not support x86-64-v2
+
+After restart, three Docker containers came up fine but `guac-db` (MySQL 8.0) kept crashing:
+
+```
+Fatal glibc error: CPU does not support x86-64-v2
+```
+
+**Root cause:** The default Proxmox CPU model is `kvm64`, which emulates a baseline x86-64 CPU without AVX/POPCNT instructions. MySQL 8.0 (and any modern glibc binary) requires x86-64-v2 feature level (SSE4.2, POPCNT, etc.).
+
+**Fix:**
+
+```bash
+qm stop 105
+qm set 105 --cpu host    # Expose all host CPU features to VM
+qm start 105
+```
+
+### Final state
+
+```bash
+ssh root@192.168.0.86 "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
+# guacamole   Up    8080/tcp
+# nginx       Up    0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp
+# guac-db     Up (healthy)    3306/tcp
+# guacd       Up    4822/tcp
+```
+
+### Final VM 105 config
+
+```
+bios: ovmf
+cpu: host
+efidisk0: local-lvm:vm-105-disk-1,efitype=4m,pre-enrolled-keys=0
+machine: q35
+net0: virtio=BC:24:11:EA:C0:FD,bridge=vmbr0
+scsi0: local-lvm:vm-105-disk-0,size=40G
+serial0: socket
+vga: std
+balloon: 512
+```
+
+Guacamole web UI: `http://192.168.0.86` / `https://192.168.0.86`
+
+---
+
+## 12. Final VM States
 
 | VM | Name | Status | Disk | IP | Notes |
 |----|------|--------|------|----|-------|
@@ -748,8 +900,8 @@ User: `farid` / `<password>`
 | 101 | rds | Stopped | scsi0 (22GB) | — | Needs OVMF + VirtIO SCSI driver install |
 | 102 | rds2 | Stopped | scsi0 (90GB) | — | Base vhdx only, checkpoint NOT merged |
 | 103 | arthur | Stopped | scsi0 (54GB) + scsi1 (55GB) | — | Linux, needs netplan + IP config |
-| **104** | **arthur-server2** | **Running** | scsi0 (90GB) + scsi1 (180GB) | **192.168.0.200** | **GPU+AI fully working ✅** |
-| 105 | guacamole | Stopped | scsi0 (40GB) | — | Linux, needs netplan + IP config |
+| **104** | **arthur-server2** | **Running** | scsi0 (90GB) + scsi1 (180GB) | **192.168.0.87** | **GPU+AI fully working ✅** |
+| **105** | **guacamole** | **Running** | scsi0 (40GB) | **192.168.0.86** | **All Docker containers healthy ✅** |
 | **106** | **yt** | **Running** | scsi0 (127GB) | **192.168.0.92** | **VirtIO SCSI working ✅** |
 
 ### VM 104 — Full Spec
@@ -759,8 +911,22 @@ RAM:      40 GB (balloon min 1 GB)
 GPU:      RTX 5060 Ti (16GB VRAM) via PCIe passthrough
 CUDA:     12.8
 PyTorch:  2.11.0+cu128
-SSH:      ssh arthur@192.168.0.200 (passwordless key)
+SSH:      ssh arthur@192.168.0.87 (passwordless key)
 AI env:   /home/arthur/ai-env
+```
+
+### VM 105 — Full Spec
+```
+Cores:    2
+RAM:      2 GB (balloon min 512 MB)
+CPU:      host (required for x86-64-v2 / MySQL 8.0)
+OS:       Ubuntu Linux
+Disk:     40 GB (LVM on LVM: ubuntu-vg/ubuntu-lv)
+NIC:      VirtIO Ethernet
+IP:       192.168.0.86
+SSH:      ssh root@192.168.0.86 (passwordless key)
+Docker:   guacamole, guacd, nginx, guac-db (MySQL 8.0)
+Web UI:   http://192.168.0.86 / https://192.168.0.86
 ```
 
 ### VM 106 — Full Spec
@@ -774,7 +940,7 @@ NIC:     VirtIO Ethernet
 
 ---
 
-## 12. Remaining Work
+## 13. Remaining Work
 
 ### VMs 100 (dc) and 101 (rds) — Need VirtIO SCSI driver install
 
@@ -829,22 +995,25 @@ rm /tmp/rds2-base.vhdx /tmp/rds2.avhdx
 # Then apply dummy disk trick for VirtIO SCSI
 ```
 
-### VMs 103 (arthur) and 105 (guacamole) — Linux config
+### VM 103 (arthur) — Linux config
 
 Linux VMs support VirtIO SCSI natively (no driver install needed):
 
 ```bash
-# Just need OVMF + static IP via guestfish
-VM=103  # or 105
-MAC=$(qm config $VM | grep net0 | grep -oP '[0-9A-F:]{17}')
+# Need OVMF + static IP via guestfish, and --cpu host
+MAC=$(qm config 103 | grep net0 | grep -oP '[0-9A-F:]{17}')
 
-VM_ID=$VM MAC=$MAC IP=192.168.0.XXX bash scripts/fix-linux-vm-networking.sh
-qm start $VM
+# Apply same guestfish netplan patch as VM 104 / 105
+# Assign an IP (TBD), set --cpu host
+qm set 103 --bios ovmf --machine q35 --cpu host
+qm set 103 --efidisk0 local-lvm:1,efitype=4m,pre-enrolled-keys=0
+qm set 103 --serial0 socket --vga std
+qm start 103
 ```
 
 ---
 
-## 13. Key Lessons Learned
+## 14. Key Lessons Learned
 
 ### 1. VirtIO SCSI PCI controller is invisible without a scsi disk
 
@@ -877,7 +1046,39 @@ lvs pve           # Shows actual LV names
 lvextend -l +100%FREE pve/data   # Correct ✅
 ```
 
-### 6. WinRM authentication for Workgroup VMs
+### 6. Activate thin LVs before guestfish
+
+Proxmox thin-provisioned LVs start in an inactive state (`Vwi---tz--`). guestfish will fail to open them until activated:
+
+```bash
+lvchange -ay pve/vm-105-disk-0
+lvs pve | grep vm-105   # Confirm: Vwi-a-tz--
+```
+
+### 7. Always use `--cpu host` for any VM running Docker with MySQL 8.0+ or modern glibc
+
+The default `kvm64` CPU model does not expose x86-64-v2 instructions (SSE4.2, POPCNT). MySQL 8.0 and newer glibc binaries fail with:
+```
+Fatal glibc error: CPU does not support x86-64-v2
+```
+
+`--cpu host` passes all physical CPU features through to the VM. Apply it to all Linux VMs running modern software:
+
+```bash
+qm set <vmid> --cpu host
+```
+
+### 8. After force-killing a QEMU process, fsck the VM's filesystems before restarting
+
+```bash
+kpartx -av /dev/pve/vm-105-disk-0     # Expose inner partitions
+vgscan && vgchange -ay ubuntu-vg       # Activate nested LVM if present
+e2fsck -p /dev/mapper/pve-vm--105--disk--0p2
+e2fsck -p /dev/ubuntu-vg/ubuntu-lv
+kpartx -dv /dev/pve/vm-105-disk-0     # Clean up
+```
+
+### 9. WinRM authentication for Workgroup VMs
 
 ```powershell
 # Must use .\username (dot-backslash for local account)
@@ -893,7 +1094,7 @@ $s    = New-PSSession -ComputerName 192.168.0.92 -Credential $cred `
 
 ---
 
-## 14. Quick Reference — All Commands
+## 15. Quick Reference — All Commands
 
 ### NVMe mount
 ```bash
@@ -942,7 +1143,8 @@ qemu-img convert -p -f vhdx child.avhdx -O raw /dev/pve/vm-XYZ-disk-0
 
 ### SSH to VMs
 ```bash
-ssh arthur@192.168.0.200   # VM 104 (passwordless key)
+ssh arthur@192.168.0.87   # VM 104 (passwordless key)
+ssh root@192.168.0.86      # VM 105 guacamole (passwordless key)
 ```
 
 ### WinRM to VM 106
